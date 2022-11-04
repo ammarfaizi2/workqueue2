@@ -23,6 +23,8 @@ WorkQueue::WorkQueue(uint32_t nr_max_work, uint32_t nr_max_thread,
 	nr_max_thread_(nr_max_thread),
 	nr_min_idle_thread_(nr_min_idle_thread)
 {
+	stop_.store(false, std::memory_order_relaxed);
+	enqueue_blocked_.store(false, std::memory_order_relaxed);
 	nr_online_threads_.store(0u, std::memory_order_relaxed);
 	nr_online_idle_threads_.store(0u, std::memory_order_relaxed);
 	nr_schedule_call_waiting_.store(0u, std::memory_order_relaxed);
