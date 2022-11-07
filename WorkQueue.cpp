@@ -111,6 +111,9 @@ int WorkQueue::ScheduleWork(void (*func)(void *data), void *data,
 			ret = SpawnWorkerExtra(wt);
 			if (!ret)
 				return 0;
+
+			wt->work_.func_ = nullptr;
+			PutWorker(wt);
 		}
 	}
 
