@@ -1,573 +1,77 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  *
- * Copyright (C) 2022  Ammar Faizi <ammarfaizi2@gnuweeb.org>
+ * Copyright (C) 2022-2023  Ammar Faizi <ammarfaizi2@gnuweeb.org>
  *
  */
+#include "WorkQueue.h"
 
 #include <chrono>
-#include <cassert>
+#include <cstdlib>
 #include <cstring>
-
-#include "WorkQueue.h"
+#include <cassert>
 
 using namespace std::chrono_literals;
 
-namespace Wq {
+#ifndef __hot
+#define __hot		__attribute__((__hot__))
+#endif
 
-WorkQueue::WorkQueue(uint32_t nr_max_work, uint32_t nr_max_thread,
-		     uint32_t nr_min_idle_thread) noexcept:
-	workers_(nullptr),
-	queue_(nr_max_work),
-	free_worker_idx_(nr_max_thread),
-	nr_max_thread_(nr_max_thread),
-	nr_min_idle_thread_(nr_min_idle_thread)
+#ifndef __cold
+#define __cold		__attribute__((__cold__))
+#endif
+
+#ifdef __CHECKER__
+#define __must_hold(x)		__attribute__((context(x,1,1)))
+#define __acquires(x)		__attribute__((context(x,0,1)))
+#define __cond_acquires(x)	__attribute__((context(x,0,-1)))
+#define __releases(x)		__attribute__((context(x,1,0)))
+#else /* #ifdef __CHECKER__ */
+#define __must_hold(X)
+#define __acquires(X)
+#define __releases(X)
+#define __cond_acquires(X)
+#endif /* #ifdef __CHECKER__ */
+
+#ifndef __always_inline
+#define __always_inline __attribute__((__always_inline__)) inline
+#endif
+
+#ifndef noinline
+#define noinline __attribute__((__noinline__))
+#endif
+
+#ifndef likely
+#define likely(COND)	__builtin_expect(!!(COND), 1)
+#endif
+
+#ifndef unlikely
+#define unlikely(COND)	__builtin_expect(!!(COND), 0)
+#endif
+
+inline WorkQueue::WorkerThread::WorkerThread(void):
+	thread_(nullptr),
+	always_idle_(false)
 {
-	stop_.store(false, std::memory_order_relaxed);
-	enqueue_blocked_.store(false, std::memory_order_relaxed);
-	nr_online_threads_.store(0u, std::memory_order_relaxed);
-	nr_online_idle_threads_.store(0u, std::memory_order_relaxed);
-	nr_schedule_call_waiting_.store(0u, std::memory_order_relaxed);
+	state_.store(THREAD_DEAD, std::memory_order_relaxed);
 }
 
-inline int WorkQueue::RawScheduleWork(struct Work *w)
-	__must_hold(&queue_lock_)
+inline WorkQueue::WorkerThread::~WorkerThread(void)
 {
-	/*
-	 * TODO(ammarfaizi2): Add tracing feature.
-	 */
-	return queue_.Push(w);
-}
-
-/*
- * Try to schedule a task work, if we can't acquire the
- * mutex or the queue is full, it returns -EAGAIN. This
- * function will not sleep.
- */
-int WorkQueue::TryScheduleWork(void (*func)(void *data), void *data,
-			       void (*deleter)(void *data)) noexcept
-{
-	struct Work w;
-	int ret;
-
-	if (unlikely(!func))
-		return -EINVAL;
-
-	if (ShouldStop())
-		return -EOWNERDEAD;
-
-	if (unlikely(IsEnqueueBlocked()))
-		return -EAGAIN;
-
-	if (unlikely(!queue_lock_.try_lock()))
-		return -EAGAIN;
-
-	w.func_ = func;
-	w.data_ = data;
-	w.deleter_ = deleter;
-	ret = RawScheduleWork(&w);
-	queue_lock_.unlock();
-
-	if (likely(!ret))
-		queue_cond_.notify_one();
-
-	return ret;
-}
-
-/*
- * Schedule a task work. If the queue is full, it will
- * be sleeping and retrying to enqueue the task work
- * until it succeeds.
- *
- * If the destructor is called (or ShouldStop() returns
- * true) before it manages to put the task work into
- * the queue, it cancels the submission and returns
- * -EOWNERDEAD.
- */
-int WorkQueue::ScheduleWork(void (*func)(void *data), void *data,
-			    void (*deleter)(void *data)) noexcept
-{
-	struct Work w;
-	int ret;
-
-	if (unlikely(!func))
-		return -EINVAL;
-
-	if (ShouldStop())
-		return -EOWNERDEAD;
-
-	if (unlikely(IsEnqueueBlocked()))
-		return -EAGAIN;
-
-	w.func_ = func;
-	w.data_ = data;
-	w.deleter_ = deleter;
-
-	if (!GetNrIdleThreads()) {
-		struct WorkerThread *wt = GetWorker();
-
-		if (wt) {
-			wt->work_ = w;
-			ret = SpawnWorkerExtra(wt);
-			if (!ret)
-				return 0;
-
-			wt->work_.func_ = nullptr;
-			PutWorker(wt);
-		}
-	}
-
-	std::unique_lock<std::mutex> lk(queue_lock_);
-
-	while (1) {
-		if (ShouldStop())
-			return -EOWNERDEAD;
-
-		ret = queue_.Push(&w);
-		if (!ret)
-			break;
-
-		IncScheduleCallWaiting();
-		schedule_cond_.wait(lk);
-		DecScheduleCallWaiting();
-	}
-
-	if (likely(!ret))
-		queue_cond_.notify_one();
-
-	return ret;
-}
-
-/*
- * Wait for all pending task works get executed. When
- * waiting, if another thread schedules a task work,
- * the submission will fail with -EAGAIN.
- */
-void WorkQueue::WaitAll(void) noexcept
-{
-	assert(!IsEnqueueBlocked());
-
-	std::unique_lock<std::mutex> lk(queue_lock_);
-	enqueue_blocked_.store(true, std::memory_order_release);
-	while (1) {
-		if (!queue_.GetSize())
-			break;
-
-		if (ShouldStop())
-			break;
-
-		wait_all_cond_.wait(lk);
-	}
-	enqueue_blocked_.store(false, std::memory_order_release);
-}
-
-inline void WorkQueue::PutWorker(struct WorkerThread *wt)
-{
-	assert(!wt->HasWork());
-
-	std::unique_lock<std::mutex> lk(workers_lock_);
-	assert(free_worker_idx_.Push(wt->idx_) == 0);
-}
-
-struct WorkerThread *WorkQueue::GetWorker(void)
-{
-	struct WorkerThread *ret = nullptr;
-	uint32_t idx;
-
-	if (ShouldStop())
-		return ret;
-
-	std::unique_lock<std::mutex> lk(workers_lock_);
-	if (likely(!free_worker_idx_.Pop(&idx))) {
-		ret = &workers_[idx];
-		assert(!ret->HasWork());
-		assert(ret->idx_ == idx);
-	}
-	return ret;
-}
-
-inline int WorkQueue::GrabWorkWait(struct WorkerThread *wt,
-				   std::unique_lock<std::mutex> &lk)
-	__must_hold(&queue_lock_)
-{
-	if (wt->idle_) {
-		queue_cond_.wait(lk);
-		return 0;
-	}
-
-	auto ret = queue_cond_.wait_for(lk, 1s);
-	if (ret == std::cv_status::timeout)
-		return -ETIME;
-
-	return 0;
-}
-
-inline void WorkQueue::NotifyWaitAllCall(void)
-	__must_hold(&queue_lock_)
-{
-	if (queue_.GetSize() > 0)
-		return;
-
-	if (enqueue_blocked_.load(std::memory_order_acquire))
-		wait_all_cond_.notify_one();
-}
-
-inline void WorkQueue::NotifyScheduleCall(void)
-	__must_hold(&queue_lock_)
-{
-	if (GetNRScheduleCallWaiting())
-		schedule_cond_.notify_one();
-}
-
-inline
-void WorkQueue::SpawnWorkerIfExhausted(std::unique_lock<std::mutex> &qlock)
-	__must_hold(&queue_lock_)
-{
-	struct WorkerThread *wt;
-	bool pop_ok;
-	int ret;
-
-	if (likely(queue_.GetSize() < 2))
-		return;
-
-	if (GetNrOnlineThread() == nr_max_thread_)
-		return;
-
-	qlock.unlock();
-	wt = GetWorker();
-	qlock.lock();
-	if (!wt)
-		return;
-
-	ret = queue_.Pop(&wt->work_);
-	pop_ok = (ret == 0);
-
-	ret = SpawnWorkerExtra(wt);
-	if (unlikely(ret && pop_ok)) {
-		/*
-		 * Failed to spawn the worker, but we already popped
-		 * the task work. Put it back into the queue.
-		 *
-		 * This push must not fail, because we are still
-		 * holding the @queue_lock_, so it's impossible
-		 * for someone makes the queue full before us.
-		 */
-		assert(queue_.Push(&wt->work_) == 0);
-		wt->work_.func_ = nullptr;
+	if (thread_) {
+		thread_->join();
+		delete thread_;
 	}
 }
 
-__hot inline int WorkQueue::GrabWork(struct WorkerThread *wt)
-{
-	std::unique_lock<std::mutex> lk(queue_lock_);
-
-	if (ShouldStop())
-		return -EOWNERDEAD;
-
-	SpawnWorkerIfExhausted(lk);
-	if (wt->HasWork())
-		return 0;
-
-	while (1) {
-		int ret;
-
-		if (ShouldStop())
-			return -EOWNERDEAD;
-
-		if (!queue_.Pop(&wt->work_)) {
-			NotifyScheduleCall();
-			NotifyWaitAllCall();
-			return 0;
-		}
-
-		ret = GrabWorkWait(wt, lk);
-		if (ret)
-			return ret;
-	}
-}
-
-__hot noinline void WorkQueue::StartWorker(struct WorkerThread *wt)
-{
-	std::unique_lock<std::mutex> lk(wt->lock_);
-
-	wt->SetState(THREAD_INTERRUPTIBLE);
-	IncOnline();
-	IncOnlineIdle();
-
-	if (wt->idle_)
-		StartWorkerThreadIdle(wt);
-	else
-		StartWorkerThreadExtra(wt);
-
-	DecOnlineIdle();
-	DecOnline();
-	assert(!wt->HasWork());
-	wt->SetState(THREAD_ZOMBIE);
-	PutWorker(wt);
-}
-
-__hot noinline int WorkQueue::DoWork(struct WorkerThread *wt)
-{
-	struct Work *w;
-	int ret;
-
-	ret = GrabWork(wt);
-	if (unlikely(ret)) {
-
-		if (likely(!wt->HasWork()))
-			return ret;
-
-		w = &wt->work_;
-		if (w->deleter_)
-			w->deleter_(w->data_);
-
-		w->func_ = nullptr;
-		return ret;
-	}
-
-	assert(wt->HasWork());
-	DecOnlineIdle();
-	wt->SetState(THREAD_UNINTERRUPTIBLE);
-	w = &wt->work_;
-
-	if (unlikely(ShouldStop())) {
-		/*
-		 * We managed to grab a work, but the destructor
-		 * has been invoked. We are exiting now...
-		 */
-		ret = -EOWNERDEAD;
-	} else {
-		/*
-		 * Execute the work. This may take some time. At
-		 * this point, if the destructor is invoked, the
-		 * destructor will be waiting for us to finish
-		 * the work.
-		 *
-		 * TODO(ammarfaizi2):
-		 * Make it possible for the task work to cancel
-		 * itself when the destructor is called while
-		 * executing @w->func_.
-		 */
-		w->func_(w->data_);
-		ret = 0;
-	}
-
-	if (w->deleter_)
-		w->deleter_(w->data_);
-
-	w->func_ = nullptr;
-	wt->SetState(THREAD_INTERRUPTIBLE);
-	IncOnlineIdle();
-	return ret;
-}
-
-__hot noinline void WorkQueue::StartWorkerThreadIdle(struct WorkerThread *wt)
-{
-	int ret;
-
-	while (1) {
-		ret = DoWork(wt);
-		if (unlikely(ret != 0))
-			break;
-	}
-}
-
-__hot noinline void WorkQueue::StartWorkerThreadExtra(struct WorkerThread *wt)
-{
-	uint32_t counter = 0;
-	int ret;
-
-	while (1) {
-		ret = DoWork(wt);
-		if (likely(ret == 0)) {
-			counter = 0;
-			continue;
-		}
-
-		if (unlikely(ret != -ETIME))
-			break;
-
-		if (unlikely(++counter >= wq_idle_seconds_))
-			break;
-	}
-}
-
-int WorkQueue::SpawnWorker(struct WorkerThread *wt, bool idle)
-{
-	std::unique_lock<std::mutex> lk(wt->lock_);
-	std::thread *t;
-
-	t = wt->thread_.load(std::memory_order_acquire);
-	if (t) {
-		assert(wt->GetState() == THREAD_ZOMBIE);
-		t->join();
-		delete t;
-		wt->thread_.store(nullptr, std::memory_order_release);
-		t = nullptr;
-	}
-
-	try {
-		/*
-		 * TODO(ammarfaizi2):
-		 * Ensure the std::thread here won't throw any exceptions.
-		 * If it may throw, make sure we handle it with a
-		 * try-and-catch statement. The caller should not care
-		 * about the exception. We want to convert the exception
-		 * to an error code.
-		 *
-		 * IIRC, std::thread may throw an OS error with -EAGAIN if
-		 * it fails to create an OS thread. Of course! That's what
-		 * the pthread_create() does too.
-		 */
-		t = new(std::nothrow) std::thread([this, wt](){
-			this->StartWorker(wt);
-		});
-
-	} catch (const std::system_error& e) {
-		int err = e.code().value();
-
-		if (t)
-			delete t;
-
-		return err;
-	}
-
-	if (unlikely(!t))
-		return -ENOMEM;
-
-	wt->idle_ = idle;
-	wt->thread_.store(t, std::memory_order_release);
-	return 0;
-}
-
-inline int WorkQueue::SpawnWorkerExtra(struct WorkerThread *wt)
-{
-	return SpawnWorker(wt, false);
-}
-
-inline int WorkQueue::SpawnWorkerIdle(struct WorkerThread *wt)
-{
-	return SpawnWorker(wt, true);
-}
-
-__cold inline int WorkQueue::InitWorkers(void)
-{
-	uint32_t i;
-
-	workers_ = new(std::nothrow) struct WorkerThread[nr_max_thread_];
-	if (!workers_)
-		return -ENOMEM;
-
-	for (i = nr_max_thread_; i--;) {
-		workers_[i].idx_ = i;
-		free_worker_idx_.Push(i);
-	}
-
-	for (i = 0; i < nr_min_idle_thread_; i++) {
-		struct WorkerThread *wt = GetWorker();
-		int ret;
-
-		assert(wt);
-		ret = SpawnWorkerIdle(wt);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-__cold int WorkQueue::Init(void) noexcept
-{
-	int ret;
-
-	if (nr_min_idle_thread_ > nr_max_thread_)
-		return -EINVAL;
-
-	ret = queue_.Init();
-	if (ret)
-		return ret;
-
-	ret = free_worker_idx_.Init();
-	if (ret)
-		return ret;
-
-	return InitWorkers();
-}
-
-inline void WorkQueue::DestroyQueue(void)
-	__must_hold(&queue_lock_)
-{
-	/*
-	 * When we're exiting, we may be holding pending task
-	 * works. A task work may have a data that needs to
-	 * be deleted. Call the deleter.
-	 */
-	while (1) {
-		struct Work w;
-
-		if (queue_.Pop(&w))
-			break;
-
-		if (w.deleter_)
-			w.deleter_(w.data_);
-	}
-}
-
-inline void WorkQueue::DestroyWorker(void)
-	__must_hold(&workers_lock_)
-{
-	uint32_t i;
-
-	if (!workers_)
-		return;
-
-	for (i = 0; i < nr_max_thread_; i++) {
-		struct WorkerThread *wt = &workers_[i];
-		std::thread *t;
-
-		t = wt->thread_.load(std::memory_order_acquire);
-		if (!t)
-			continue;
-
-		workers_lock_.unlock();
-		t->join();
-		delete t;
-		assert(wt->GetState() == THREAD_ZOMBIE);
-		wt->thread_.store(nullptr, std::memory_order_release);
-		workers_lock_.lock();
-		assert(!wt->HasWork());
-	}
-
-	delete[] workers_;
-	workers_ = nullptr;
-}
-
-__cold
-WorkQueue::~WorkQueue(void) noexcept
-{
-	stop_.store(true, std::memory_order_release);
-	queue_lock_.lock();
-	DestroyQueue();
-	NotifyScheduleCall();
-	NotifyWaitAllCall();
-	queue_cond_.notify_all();
-	queue_lock_.unlock();
-
-	workers_lock_.lock();
-	DestroyWorker();
-	workers_lock_.unlock();
-}
-
-void WorkerThread::SetState(enum WorkerThreadState st) noexcept
+inline void WorkQueue::WorkerThread::SetState(wstate_t st)
 {
 #if defined(__linux__)
-	std::thread *t;
 	char name[64];
 	char state;
 	char idle;
 
-	t = thread_.load(std::memory_order_acquire);
-	if (!t)
+	if (unlikely(!thread_))
 		goto out;
 
 	switch (st) {
@@ -588,12 +92,663 @@ void WorkerThread::SetState(enum WorkerThreadState st) noexcept
 		break;
 	}
 
-	idle = (idle_ ? 'i' : 'e');
-	snprintf(name, sizeof(name), "wq-%c%c-%u", idle, state, idx_);
-	pthread_setname_np(t->native_handle(), name);
+	idle = (always_idle_ ? 'i' : 'e');
+	snprintf(name, sizeof(name), "wq-%c%c-%u", idle, state, index_);
+	pthread_setname_np(thread_->native_handle(), name);
 out:
-#endif
-	state_.store(st, std::memory_order_release);
+#endif /* #if defined(__linux__) */
+
+	state_.store(st, std::memory_order_acquire);
 }
 
-} /* namespace Wq */
+inline WorkQueue::wstate_t WorkQueue::WorkerThread::GetState(void)
+{
+	return state_.load(std::memory_order_acquire);
+}
+
+inline void WorkQueue::Queue::Lock(void)
+	__acquires(&lock_)
+{
+	lock_.lock();
+}
+
+inline void WorkQueue::Queue::Unlock(void)
+	__releases(&lock_)
+{
+	lock_.unlock();
+}
+
+inline WorkQueue::Queue::Queue(uint32_t entries):
+	head_(0),
+	tail_(0),
+	nr_cond_wait_(0),
+	arr_(nullptr)
+{
+	uint32_t i = 2;
+
+	while (i < entries)
+		i *= 2;
+
+	mask_ = i - 1;
+}
+
+inline WorkQueue::Queue::~Queue(void)
+{
+	if (arr_)
+		delete[] arr_;
+}
+
+inline int WorkQueue::Queue::Init(void)
+{
+	uint32_t max_work = mask_ + 1;
+
+	arr_ = new(std::nothrow) struct Work[max_work];
+	if (unlikely(!arr_))
+		return -ENOMEM;
+
+	return 0;
+}
+
+inline uint32_t WorkQueue::Queue::GetSize(void)
+{
+	int64_t head = static_cast<int64_t>(head_);
+	int64_t tail = static_cast<int64_t>(tail_);
+
+	return llabs(tail - head);
+}
+
+inline int WorkQueue::Queue::__Push(const struct Work *w)
+	__must_hold(&lock_)
+{
+	uint32_t size;
+
+	size = GetSize();
+	if (unlikely(size == (mask_ + 1u)))
+		return -EAGAIN;
+
+	arr_[tail_++ & mask_] = *w;
+	return 0;
+}
+
+inline int WorkQueue::Queue::__Pop(struct Work *w)
+	__must_hold(&lock_)
+{
+	uint32_t size;
+
+	size = GetSize();
+	if (unlikely(size == 0))
+		return -EAGAIN;
+
+	*w = arr_[head_++ & mask_];
+	return 0;
+}
+
+inline int WorkQueue::Queue::Push(const struct Work *w)
+{
+	int ret;
+
+	Lock();
+	ret = __Push(w);
+	Unlock();
+	return ret;
+}
+
+inline int WorkQueue::Queue::Pop(struct Work *w)
+{
+	int ret;
+
+	Lock();
+	ret = __Pop(w);
+	Unlock();
+	return ret;
+}
+
+inline void WorkQueue::Stack::Lock(void)
+	__acquires(&lock_)
+{
+	lock_.lock();
+}
+
+inline void WorkQueue::Stack::Unlock(void)
+	__releases(&lock_)
+{
+	lock_.unlock();
+}
+
+inline WorkQueue::Stack::Stack(uint32_t max_sp):
+	sp_(max_sp),
+	max_sp_(max_sp),
+	arr_(nullptr)
+{
+}
+
+inline WorkQueue::Stack::~Stack(void)
+{
+	if (arr_)
+		delete[] arr_;
+}
+
+inline int WorkQueue::Stack::__Push(uint32_t val)
+{
+	if (unlikely(sp_ == 0))
+		return -EAGAIN;
+
+	arr_[--sp_] = val;
+	return 0;
+}
+
+inline int WorkQueue::Stack::__Pop(uint32_t *out)
+{
+	if (unlikely(sp_ == max_sp_))
+		return -EAGAIN;
+
+	*out = arr_[sp_++];
+	return 0;
+}
+
+inline int WorkQueue::Stack::Push(uint32_t val)
+{
+	int ret;
+
+	Lock();
+	ret = __Push(val);
+	Unlock();
+	return ret;
+}
+
+inline int WorkQueue::Stack::Pop(uint32_t *out)
+{
+	int ret;
+
+	Lock();
+	ret = __Pop(out);
+	Unlock();
+	return ret;
+}
+
+inline int WorkQueue::Stack::Init(void)
+{
+	uint32_t i;
+
+	arr_ = new(std::nothrow) uint32_t[max_sp_];
+	if (unlikely(!arr_))
+		return -ENOMEM;
+
+	i = max_sp_ - 1;
+
+	while (i--) {
+		int tmp;
+
+		tmp = __Push(i);
+		assert(tmp == 0);
+		(void)tmp;
+	}
+
+	return 0;
+}
+
+__cold
+WorkQueue::WorkQueue(uint32_t max_work, uint32_t max_thread,
+		     uint32_t min_idle_thread) noexcept:
+	stop_(false),
+	sched_blocked_(false),
+	max_thread_(max_thread),
+	min_idle_thread_(min_idle_thread),
+	idle_thread_timeout_(30000),
+	queue_(max_work),
+	stack_(max_thread),
+	workers_(nullptr),
+	nr_sched_cond_wait_(0)
+{
+	nr_task_uninterruptible_.store(0, std::memory_order_relaxed);
+}
+
+__cold
+WorkQueue::~WorkQueue(void) noexcept
+{
+	stop_ = true;
+
+	if (workers_) {
+		queue_.Lock();
+		queue_.cond_.notify_all();
+		WakePendingScheduleCaller();
+		queue_.Unlock();
+		delete[] workers_;
+	}
+
+	queue_.Lock();
+	while (1) {
+		struct Work w;
+
+		if (queue_.__Pop(&w))
+			break;
+
+		if (w.data_deleter_)
+			w.data_deleter_(w.data_);
+	}
+	queue_.Unlock();
+
+	if (sched_blocked_) {
+		wait_uninterruptible_lock_.lock();
+		wait_uninterruptible_cond_.notify_all();
+		wait_uninterruptible_lock_.unlock();
+	}
+}
+
+inline void WorkQueue::WakePendingScheduleCaller(bool always_one) noexcept
+	__must_hold(&queue_.lock_)
+{
+	if (!nr_sched_cond_wait_)
+		return;
+
+	if (always_one || nr_sched_cond_wait_ == 1)
+		sched_cond_.notify_one();
+	else
+		sched_cond_.notify_all();
+}
+
+/*
+ * "return false" means the worker should exit.
+ * "return true"  means the worker should keep running.
+ */
+bool WorkQueue::WaitForQueueReady(struct WorkerThread *wt,
+				  std::unique_lock<std::mutex> &lock) noexcept
+	__must_hold(&queue_.lock_)
+{
+	bool ret;
+
+	queue_.nr_cond_wait_++;
+	if (wt->always_idle_) {
+		queue_.cond_.wait(lock);
+		ret = true;
+	} else {
+		auto tmp = queue_.cond_.wait_for(lock,
+						 idle_thread_timeout_ * 1ms);
+		ret = (tmp != std::cv_status::timeout);
+	}
+	queue_.nr_cond_wait_--;
+	return ret;
+}
+
+__hot inline
+struct Work *WorkQueue::GetWorkFromQueue(struct WorkerThread *wt) noexcept
+{
+	std::unique_lock<std::mutex> lock(queue_.lock_);
+
+	while (1) {
+		struct Work *w = &wt->work_;
+
+		if (unlikely(stop_))
+			return nullptr;
+
+		if (likely(!queue_.__Pop(w))) {
+			wt->SetState(THREAD_UNINTERRUPTIBLE);
+			nr_task_uninterruptible_.fetch_add(1u);
+			WakePendingScheduleCaller(true);
+			return w;
+		}
+
+		if (unlikely(!WaitForQueueReady(wt, lock)))
+			return nullptr;
+	}
+}
+
+__hot
+noinline void WorkQueue::RunWorker(struct WorkerThread *wt) noexcept
+	__must_hold(&wt->lock_)
+{
+	struct Work *w;
+
+	while (1) {
+		w = GetWorkFromQueue(wt);
+		if (!w)
+			break;
+
+		if (likely(!stop_))
+			w->func_(w->data_);
+
+		if (w->data_deleter_)
+			w->data_deleter_(w->data_);
+
+		w->Clear();
+		wt->SetState(THREAD_INTERRUPTIBLE);
+		nr_task_uninterruptible_.fetch_sub(1u);
+		if (unlikely(sched_blocked_)) {
+			wait_uninterruptible_lock_.lock();
+			wait_uninterruptible_cond_.notify_all();
+			wait_uninterruptible_lock_.unlock();
+		}
+	}
+
+	PutWorker(wt);
+}
+
+noinline void WorkQueue::PutWorker(struct WorkerThread *wt) noexcept
+{
+	int tmp;
+
+	if (wt->thread_)
+		wt->SetState(THREAD_ZOMBIE);
+	else
+		wt->SetState(THREAD_DEAD);
+
+	tmp = stack_.Push(wt->index_);
+	assert(tmp == 0);
+	(void)tmp;
+}
+
+noinline int WorkQueue::StartWorker(struct WorkerThread *wt)
+{
+	std::unique_lock<std::mutex> lock(wt->lock_);
+	std::thread *t;
+	uint32_t state;
+
+	state = wt->GetState();
+	if (wt->thread_) {
+		assert(state == THREAD_ZOMBIE);
+		wt->thread_->join();
+		delete wt->thread_;
+		wt->thread_ = nullptr;
+	} else {
+		assert(state == THREAD_DEAD);
+	}
+
+	(void)state;
+
+#if defined(__cpp_exceptions)
+	try {
+#endif
+		/*
+		 * TODO(ammarfaizi2):
+		 * Ensure the std::thread here won't throw any exceptions.
+		 * If it may throw, make sure we handle it with a
+		 * try-and-catch statement. The caller should not care
+		 * about the exception. We want to convert the exception
+		 * to an error code.
+		 *
+		 * IIRC, std::thread may throw an OS error with -EAGAIN if
+		 * it fails to create an OS thread. Of course! That's what
+		 * the pthread_create() does too, right?
+		 */
+		t = new(std::nothrow) std::thread([this, wt](){
+			wt->lock_.lock();
+			assert(wt->thread_);
+			assert(wt->GetState() == THREAD_INTERRUPTIBLE);
+			RunWorker(wt);
+			wt->lock_.unlock();
+		});
+
+#ifdef __cpp_exceptions
+	} catch (const std::system_error& e) {
+		int err = e.code().value();
+
+		if (t)
+			delete t;
+
+		return err;
+	}
+#endif
+
+	if (unlikely(!t))
+		return -ENOMEM;
+
+	wt->thread_ = t;
+	wt->SetState(THREAD_INTERRUPTIBLE);
+	return 0;
+}
+
+inline struct WorkQueue::WorkerThread *WorkQueue::GetWorker(void)
+{
+	struct WorkerThread *wt;
+	uint32_t index;
+	int tmp;
+
+	tmp = stack_.Pop(&index);
+	if (unlikely(tmp))
+		return nullptr;
+
+	wt = &workers_[index];
+	assert(wt->index_ == index);
+	return wt;
+}
+
+__cold inline int WorkQueue::InitWorkers(void)
+{
+	uint32_t i;
+	int ret;
+
+	if (min_idle_thread_ > max_thread_)
+		min_idle_thread_ = max_thread_;
+
+	workers_ = new(std::nothrow) WorkerThread[max_thread_];
+	if (unlikely(!workers_))
+		return -ENOMEM;
+
+	ret = stack_.Init();
+	if (unlikely(ret))
+		return ret;
+
+	for (i = 0; i < max_thread_; i++) {
+		struct WorkerThread *w;
+
+		w = &workers_[i];
+		w->index_ = i;
+	}
+
+	for (i = 0; i < min_idle_thread_; i++) {
+		struct WorkerThread *w;
+
+		w = GetWorker();
+		assert(w != nullptr);
+		w->always_idle_ = true;
+		ret = StartWorker(w);
+		if (unlikely(ret))
+			return ret;
+	}
+
+	return 0;
+}
+
+__cold inline int WorkQueue::InitWorkArray(void)
+{
+	int ret;
+
+	ret = queue_.Init();
+	if (unlikely(ret))
+		return ret;
+
+	return 0;
+}
+
+__cold
+int WorkQueue::Init(void) noexcept
+{
+	int ret;
+
+	ret = InitWorkers();
+	if (ret)
+		return ret;
+
+	ret = InitWorkArray();
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+inline void WorkQueue::SpawnMoreWorker(void)
+{
+	struct WorkerThread *wt;
+
+	wt = GetWorker();
+	if (!wt) {
+		/*
+		 * We hit the thread limit. Do nothing.
+		 */
+		return;
+	}
+
+	if (StartWorker(wt)) {
+		/*
+		 * Fail to start the worker, but our limit
+		 * hasn't been reached. Something wrong.
+		 *
+		 * Either OS error (ENOMEM or EAGAIN).
+		 *
+		 * Put the resource back.
+		 */
+		PutWorker(wt);
+	}
+}
+
+__hot
+__always_inline int WorkQueue::RawScheduleWork(struct Work *w,
+					       bool wait_if_queue_full)
+{
+	std::unique_lock<std::mutex> lock(queue_.lock_);
+	int ret;
+
+	if (unlikely(sched_blocked_)) {
+		/*
+		 * We are not allowed to schedule work.
+		 * Someone is calling WaitAll() right now!
+		 */
+		return -EAGAIN;
+	}
+
+	while (1) {
+		if (unlikely(stop_)) {
+			/*
+			 * The destructor has been called. It's safe to
+			 * operate on this function because we are
+			 * holding @queue_.lock_ at this point. The
+			 * destructor is waiting for us to relase the
+			 * lock.
+			 */
+			ret = -EOWNERDEAD;
+			break;
+		}
+
+		if (likely(!queue_.__Push(w))) {
+			/*
+			 * Good, the work is scheduled!
+			 */
+			ret = 0;
+			break;
+		}
+
+		if (!wait_if_queue_full) {
+			/*
+			 * The queue is full, but the caller doesn't
+			 * want to wait. Return -EAGAIN now!
+			 */
+			ret = -EAGAIN;
+			break;
+		}
+
+		nr_sched_cond_wait_++;
+		sched_cond_.wait(lock);
+		nr_sched_cond_wait_--;
+	}
+
+	if (unlikely(ret)) {
+		/*
+		 * Failed to schedule work.
+		 */
+		return ret;
+	}
+
+	if (queue_.nr_cond_wait_ > 0) {
+		/*
+		 * There are sleeping worker(s). Wake one of
+		 * them so that they consume the work we have
+		 * just scheduled.
+		 */
+		queue_.cond_.notify_one();
+	} else {
+		/*
+		 * There are no sleeping worker(s). This means
+		 * all active workers are busy. Try to spawn
+		 * a new worker.
+		 *
+		 * If we haven't reached the max thread limit, a
+		 * new worker will be created.
+		 *
+		 * If we have reached the max thread limit, this
+		 * will fail. But that is fine, the next free
+		 * worker will pick our scheduled work.
+		 */
+		SpawnMoreWorker();
+	}
+	return 0;
+}
+
+__hot
+int WorkQueue::ScheduleWork(void (*func)(void *data), void *data,
+			    void (*data_deleter)(void *data),
+			    bool wait_if_queue_full) noexcept
+{
+	struct Work w;
+
+	w.data_ = data;
+	w.func_ = func;
+	w.data_deleter_ = data_deleter;
+	return RawScheduleWork(&w, wait_if_queue_full);
+}
+
+void WorkQueue::WaitAll(void) noexcept
+{
+	std::unique_lock<std::mutex> lock_q(queue_.lock_);
+	std::unique_lock<std::mutex> lock_w(wait_uninterruptible_lock_);
+
+	sched_blocked_ = true;
+	while (1) {
+
+		/*
+		 * Wait for the queue to be empty. At this point,
+		 * no one can add work to the queue because
+		 * @sched_blocked_ is true.
+		 */
+
+		if (stop_)
+			break;
+
+		if (queue_.GetSize() == 0)
+			break;
+
+		nr_sched_cond_wait_++;
+		sched_cond_.wait(lock_q);
+		nr_sched_cond_wait_--;
+	}
+
+	while (1) {
+
+		/*
+		 * Wait for all uinterruptible tasks finish.
+		 */
+
+		if (stop_)
+			break;
+
+		if (!nr_task_uninterruptible_.load(std::memory_order_acquire))
+			break;
+
+		wait_uninterruptible_cond_.wait(lock_w);
+	}
+	sched_blocked_ = false;
+}
+
+void WorkQueue::SetIdleThreadTimeout(uint32_t ms) noexcept
+{
+	std::unique_lock<std::mutex> lock(queue_.lock_);
+
+	idle_thread_timeout_ = ms;
+
+	if (!queue_.nr_cond_wait_)
+		return;
+
+	if (queue_.nr_cond_wait_ == 1)
+		queue_.cond_.notify_one();
+	else
+		queue_.cond_.notify_all();
+}

@@ -1,54 +1,35 @@
 
-#include <unistd.h>
-#include <cassert>
 #include "WorkQueue.h"
+#include <unistd.h>
 
-using Wq::WorkQueue;
+static std::atomic<uint32_t> x = 0;
 
-static std::atomic<uint32_t> g_counter;
-
-void work_func(void *data_)
+static void test_func(void *data)
 {
-	(void)data_;
-	sleep(1);
-	g_counter.fetch_add(1);
-}
-
-void data_deleter(void *data)
-{
-	delete static_cast<int *>(data);
+	x.fetch_add(1);
+	__asm__ volatile ("nop");
+	(void)data;
 }
 
 int main(void)
 {
-	uint32_t total_schedule = 0;
-	WorkQueue *wq;
-	int iter = 3;
-	int *data;
+	const uint32_t max_work = 10240 * 10;
+	const uint32_t max_thread = 128;
+	const uint32_t min_idle_thread = 3;
+	WorkQueue wq(max_work, max_thread, min_idle_thread);
+	uint32_t i;
 	int ret;
-	int i;
 
-	wq = new WorkQueue(10240, 10240);
-	ret = wq->Init();
-	if (ret)
-		return -ret;
-
-	g_counter.store(0);
-	while (iter--) {
-		wq->SetWQIdleSeconds(3);
-		for (i = 0; i < 10240; i++) {
-			data = new int;
-			*data = i;
-			ret = wq->ScheduleWork(work_func, data, data_deleter);
-			if (!ret)
-				total_schedule++;
-		}
-		wq->WaitAll();
-		printf("Sleeping for 5 seconds...\n");
-		sleep(5);
+	ret = wq.Init();
+	if (ret < 0) {
+		printf("Cannot allocate memory!\n");
+		return ret;
 	}
 
-	assert(g_counter.load() == total_schedule);
-	delete wq;
+	for (i = 0; i < max_work; i++)
+		wq.ScheduleWork(test_func);
+
+	wq.WaitAll();
+	printf("x = %u\n", x.load());
 	return 0;
 }
